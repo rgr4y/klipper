@@ -273,6 +273,15 @@ config STM32F103GD_DISABLE_SWD
         and PA14 pins from being available. Selecting this option
         disables SWD at startup and thus makes these pins available.
 
+config WANT_UART_BRIDGE
+    bool "UART passthrough on USART1 PA10/PA9 (e.g. Ender-3 V2 DWIN panel)"
+    depends on MACH_STM32G0 && !STM32_SERIAL_USART1
+    default n
+    help
+        Lets the host send and receive raw bytes on USART1 (PA10=RX,
+        PA9=TX) through the Klipper link. Used with the uart_bridge
+        klippy module to drive a serial display wired to the board.
+
 config STM32_DFU_ROM_ADDRESS
     hex
     default 0 if !USB
