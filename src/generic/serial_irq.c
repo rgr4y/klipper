@@ -17,6 +17,7 @@
 #define RX_BUFFER_SIZE 192
 
 static uint8_t receive_buf[RX_BUFFER_SIZE], receive_pos;
+uint8_t serial_rx_valid;
 static uint8_t transmit_buf[96], transmit_pos, transmit_max;
 
 DECL_CONSTANT("SERIAL_BAUD", CONFIG_SERIAL_BAUD);
@@ -76,8 +77,10 @@ console_task(void)
 {
     uint_fast8_t rpos = readb(&receive_pos), pop_count;
     int_fast8_t ret = command_find_block(receive_buf, rpos, &pop_count);
-    if (ret > 0)
+    if (ret > 0) {
+        serial_rx_valid = 1;
         command_dispatch(receive_buf, pop_count);
+    }
     if (ret) {
         if (CONFIG_HAVE_BOOTLOADER_REQUEST && ret < 0 && pop_count == 32
             && !memcmp(receive_buf, " \x1c Request Serial Bootloader!! ~", 32))

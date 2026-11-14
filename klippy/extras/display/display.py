@@ -7,6 +7,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging, os, ast
 from . import aip31068_spi, hd44780, hd44780_spi, st7920, uc1701, menu
+from . import lerdge_tft
 
 # Normal time between each screen redraw
 REDRAW_TIME = 0.500
@@ -18,7 +19,8 @@ LCD_chips = {
     'hd44780': hd44780.HD44780, 'uc1701': uc1701.UC1701,
     'ssd1306': uc1701.SSD1306, 'sh1106': uc1701.SH1106,
     'hd44780_spi': hd44780_spi.hd44780_spi,
-    'aip31068_spi':aip31068_spi.aip31068_spi
+    'aip31068_spi':aip31068_spi.aip31068_spi,
+    'lerdge_tft': lerdge_tft.LerdgeTFT,
 }
 
 # Storage of [display_template my_template] config sections
@@ -194,6 +196,8 @@ class PrinterLCD:
         dgroup = "_default_16x4"
         if self.lcd_chip.get_dimensions()[0] == 20:
             dgroup = "_default_20x4"
+        if hasattr(self.lcd_chip, 'get_default_display_group'):
+            dgroup = self.lcd_chip.get_default_display_group()
         dgroup = config.get('display_group', dgroup)
         self.show_data_group = self.display_data_groups.get(dgroup)
         if self.show_data_group is None:

@@ -1026,6 +1026,12 @@ class MenuManager:
             self.begin(eventtime)
 
     def key_event(self, key, eventtime):
+        # Allow the display to handle keys itself (for example a display
+        # that currently shows another program)
+        hook = getattr(getattr(self.display, 'lcd_chip', None),
+                       'menu_key_hook', None)
+        if hook is not None and hook(key, eventtime):
+            return
         if key == 'click':
             self._click_callback(eventtime, key)
         elif key == 'long_click':

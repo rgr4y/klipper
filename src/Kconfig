@@ -56,6 +56,15 @@ config SERIAL_BAUD
     help
         Specify the baud rate of the serial port. This should be set
         to 250000. Read the FAQ before changing this value.
+config SERIAL_BAUD_FALLBACK
+    depends on SERIAL && MACH_STM32
+    int "Fallback baud rate if no valid data is received (0 to disable)" if LOW_LEVEL_OPTIONS
+    default 0
+    help
+        Until the first valid message is received, alternate between
+        the main baud rate and this rate every 20 seconds.  This allows a
+        host to connect at this rate if the main baud rate does not work
+        on the wiring.
 
 # Generic configuration options for USB
 config USBSERIAL
@@ -135,6 +144,10 @@ config WANT_ST7920
 config WANT_HD44780
     bool
     depends on HAVE_GPIO
+    default y
+config WANT_TFT_FSMC
+    bool
+    depends on MACH_STM32F4 || MACH_STM32F103
     default y
 config WANT_ADXL345
     bool
@@ -238,6 +251,9 @@ config WANT_ST7920
 config WANT_HD44780
     bool "Support HD44780 LCD display"
     depends on HAVE_GPIO
+config WANT_TFT_FSMC
+    bool "Support parallel (FSMC) TFT displays (Lerdge, Tronxy/Chitu, etc.)"
+    depends on MACH_STM32F4 || MACH_STM32F103
 comment "Accelerometer chips"
     depends on WANT_SPI || WANT_I2C
 config WANT_ADXL345

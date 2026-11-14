@@ -67,6 +67,7 @@ src-$(CONFIG_WANT_ADC) += $(adc-src-y)
 spi-src-y := stm32/spi.c
 spi-src-$(CONFIG_MACH_STM32H7) := stm32/stm32h7_spi.c
 src-$(CONFIG_WANT_SPI) += $(spi-src-y)
+src-$(CONFIG_WANT_TFT_FSMC) += stm32/tft_fsmc.c
 i2c-src-y := stm32/stm32f0_i2c.c
 i2c-src-$(CONFIG_MACH_STM32F1) := stm32/i2c.c
 i2c-src-$(CONFIG_MACH_STM32F2) := stm32/i2c.c

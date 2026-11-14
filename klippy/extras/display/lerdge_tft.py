@@ -1,0 +1,1106 @@
+# Support for parallel (FSMC) TFT touch screens found on Lerdge boards
+#
+# The screen is driven by the "tft_fsmc" micro-controller code, the touch
+# panel (XPT2046 compatible) is read via a regular SPI bus.  The standard
+# Klipper display/menu system is rendered as a 16x6 character screen
+# (each character is an 8x16 font glyph scaled up) and a column of touch
+# buttons (up/down/ok/back).  Menu rows can also be tapped directly.
+#
+# Copyright (C) 2026  Klipper Lerdge TFT contributors
+#
+# This file may be distributed under the terms of the GNU GPLv3 license.
+import logging, base64, re
+from .. import bus
+from . import font8x14
+
+BACKGROUND_PRIORITY_CLOCK = 0x7fffffff00000000
+
+TextGlyphs = { 'right_arrow': b'\x1a', 'degrees': b'\xf8' }
+
+TEXT_COLUMNS = 16
+TEXT_ROWS = 6
+
+# Touch polling
+TOUCH_ACTIVE_POLL = 0.030
+TOUCH_IDLE_POLL = 0.100
+TOUCH_SAMPLES = 5
+TOUCH_RELEASE_COUNT = 2
+# Button timing
+REPEAT_DELAY = 0.500
+REPEAT_TIME = 0.120
+REPEAT_FAST_COUNT = 10
+LONG_PRESS_TIME = 0.800
+
+# Mirror mode (external renderer such as KlipperScreen on a virtual X display)
+MIRROR_TIMEOUT = 20.
+MIRROR_CHECK_TIME = 2.
+MAX_RLE_BYTES = 48
+TOUCH_SHUTDOWN_POLL = 0.050
+
+# Largest bitmap payload per MCU message
+MAX_BITMAP_BYTES = 32
+# Pixels written by one MCU command.  A pixel takes about 0.1us on the
+# STM32F407 FSMC, so a command keeps the MCU busy for at most ~100us (see
+# the "task" guidelines in Code_Overview.md).
+MAX_CMD_PIXELS = 1024
+
+# Number of pixels in a tft_fsmc_rle payload
+def rle_pixels(data):
+    pixels = i = 0
+    while i < len(data):
+        hdr = data[i]
+        count = (hdr & 0x7f) + 1
+        pixels += count
+        i += 3 if hdr & 0x80 else 1 + 2 * count
+    return pixels
+
+
+######################################################################
+# Display controllers
+######################################################################
+
+# Init sequences are lists of (command, parameters, delay_after).  MADCTL
+# (0x36) and display on (0x29) are sent afterwards by the driver.
+
+# ST7796S - sequence extracted from the stock Lerdge-K firmware (V4.3.3)
+ST7796S_INIT = [
+    (0x11, [], .120),                       # Sleep out
+    (0xf0, [0xc3], 0.), (0xf0, [0x96], 0.), # Enable command set 2
+    (0x3a, [0x55], 0.),                     # 16 bits per pixel
+    (0xb4, [0x01], 0.),                     # 1-dot inversion
+    (0xb7, [0xc6], 0.),                     # Entry mode
+    (0xc1, [0x15], 0.), (0xc2, [0xaf], 0.), (0xc3, [0x09], 0.),
+    (0xc5, [0x22], 0.), (0xc6, [0x00], 0.), # VCOM
+    (0xe8, [0x40, 0x8a, 0x00, 0x00, 0x29, 0x19, 0xa5, 0x33], 0.),
+    (0xe0, [0xf0, 0x04, 0x08, 0x09, 0x08, 0x15, 0x2f, 0x42, 0x46, 0x28,
+            0x15, 0x16, 0x29, 0x2d], 0.),   # Positive gamma
+    (0xe1, [0xf0, 0x04, 0x09, 0x09, 0x08, 0x15, 0x2e, 0x46, 0x46, 0x28,
+            0x15, 0x15, 0x29, 0x2d], 0.),   # Negative gamma
+    (0x53, [0x24], 0.),                     # Backlight control on
+    (0xf0, [0x3c], 0.), (0xf0, [0x69], 0.), # Disable command set 2
+]
+
+# ILI9488 (based on the Marlin ili9488 driver)
+ILI9488_INIT = [
+    (0x01, [], .120),                       # Software reset
+    (0x11, [], .120),                       # Sleep out
+    (0x3a, [0x55], 0.),
+    (0xb1, [0xa0], 0.),
+    (0xb4, [0x02], 0.),
+    (0xb6, [0x02, 0x02], 0.),
+    (0xc0, [0x15, 0x17], 0.),
+    (0xc1, [0x41], 0.),
+    (0xc5, [0x00, 0x12, 0x80], 0.),
+    (0xe9, [0x00], 0.),
+    (0xf7, [0xa9, 0x51, 0x2c, 0x82], 0.),
+    (0xe0, [0x00, 0x03, 0x09, 0x08, 0x16, 0x0a, 0x3f, 0x78, 0x4c, 0x09,
+            0x0a, 0x08, 0x16, 0x1a, 0x0f], 0.),
+    (0xe1, [0x00, 0x16, 0x19, 0x03, 0x0f, 0x05, 0x32, 0x45, 0x46, 0x04,
+            0x0e, 0x0d, 0x35, 0x37, 0x0f], 0.),
+    (0x13, [], 0.),                         # Normal display mode
+]
+
+# ILI9341 (based on the Marlin ili9341 driver)
+ILI9341_INIT = [
+    (0x01, [], .120),
+    (0x11, [], .120),
+    (0xcb, [0x39, 0x2c, 0x00, 0x34, 0x02], 0.),
+    (0xcf, [0x00, 0xc1, 0x30], 0.),
+    (0xe8, [0x85, 0x00, 0x78], 0.),
+    (0xea, [0x00, 0x00], 0.),
+    (0xed, [0x64, 0x03, 0x12, 0x81], 0.),
+    (0xb6, [0x08, 0x82, 0x27], 0.),
+    (0xf7, [0x20], 0.),
+    (0xc5, [0x3e, 0x28], 0.),
+    (0xc7, [0x86], 0.),
+    (0xb1, [0x00, 0x18], 0.),
+    (0xc0, [0x23], 0.),
+    (0xc1, [0x10], 0.),
+    (0x3a, [0x55], 0.),
+    (0xf2, [0x00], 0.),
+    (0x26, [0x01], 0.),
+    (0xe0, [0x0f, 0x31, 0x2b, 0x0c, 0x0e, 0x08, 0x4e, 0xf1, 0x37, 0x07,
+            0x10, 0x03, 0x0e, 0x09, 0x00], 0.),
+    (0xe1, [0x00, 0x0e, 0x14, 0x03, 0x11, 0x07, 0x31, 0xc1, 0x48, 0x08,
+            0x0f, 0x0c, 0x31, 0x36, 0x0f], 0.),
+    (0x13, [], 0.),
+]
+
+# name: (init sequence, width, height, controller id, inverted by default)
+CONTROLLERS = {
+    'st7796': (ST7796S_INIT, 480, 320, 0x7796, True),
+    'ili9488': (ILI9488_INIT, 480, 320, 0x9488, False),
+    'ili9341': (ILI9341_INIT, 320, 240, 0x9341, False),
+}
+MADCTL_LANDSCAPE = 0x28 # MV | BGR
+MADCTL_LANDSCAPE_180 = 0xe8 # MY | MX | MV | BGR
+
+# Default touch calibration (raw XPT2046 12bit X/Y to screen pixels)
+# derived from the defaults of the stock Lerdge-K firmware
+DEFAULT_TOUCH_CALIBRATION = [0.0001375, -0.11488, 510.55,
+                             -0.07775, 0.00017, 336.25]
+
+
+######################################################################
+# Icons (16x16, MSB first)
+######################################################################
+
+def _icon(rows):
+    out = []
+    for r in rows:
+        out.append([(r >> 8) & 0xff, r & 0xff])
+    return out
+
+ICON_UP = _icon([0x0000, 0x0180, 0x03c0, 0x07e0, 0x0ff0, 0x1ff8, 0x3ffc,
+                 0x7ffe, 0x07e0, 0x07e0, 0x07e0, 0x07e0, 0x07e0, 0x07e0,
+                 0x0000, 0x0000])
+ICON_DOWN = _icon([0x0000, 0x0000, 0x07e0, 0x07e0, 0x07e0, 0x07e0, 0x07e0,
+                   0x07e0, 0x7ffe, 0x3ffc, 0x1ff8, 0x0ff0, 0x07e0, 0x03c0,
+                   0x0180, 0x0000])
+ICON_OK = _icon([0x0000, 0x0000, 0x0003, 0x0007, 0x000e, 0x001c, 0x0038,
+                 0x6070, 0x70e0, 0x39c0, 0x1f80, 0x0f00, 0x0600, 0x0000,
+                 0x0000, 0x0000])
+ICON_BACK = _icon([0x0000, 0x0100, 0x0300, 0x0700, 0x0f00, 0x1ffe, 0x3ffe,
+                   0x7ffe, 0x3ffe, 0x1ffe, 0x0f00, 0x0700, 0x0300, 0x0100,
+                   0x0000, 0x0000])
+BUTTONS = [('up', ICON_UP), ('down', ICON_DOWN), ('ok', ICON_OK),
+           ('back', ICON_BACK)]
+
+
+######################################################################
+# Helpers
+######################################################################
+
+def parse_color(config, name, default):
+    value = config.get(name, default).strip().lstrip('#')
+    try:
+        if len(value) != 6:
+            raise ValueError()
+        rgb = int(value, 16)
+    except ValueError:
+        raise config.error("Invalid color '%s' for '%s' in section '%s'"
+                           % (value, name, config.get_name()))
+    r, g, b = (rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff
+    return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
+
+def median(values):
+    s = sorted(values)
+    return s[len(s) // 2]
+
+def solve3(m, v):
+    # Solve a 3x3 linear system using Gaussian elimination
+    a = [list(m[i]) + [v[i]] for i in range(3)]
+    for col in range(3):
+        piv = max(range(col, 3), key=lambda r: abs(a[r][col]))
+        if abs(a[piv][col]) < 1e-12:
+            return None
+        a[col], a[piv] = a[piv], a[col]
+        for r in range(3):
+            if r != col:
+                f = a[r][col] / a[col][col]
+                for c in range(col, 4):
+                    a[r][c] -= f * a[col][c]
+    return [a[i][3] / a[i][i] for i in range(3)]
+
+def fit_affine(raw_points, screen_values):
+    # Least squares fit of screen = a*rx + b*ry + c
+    m = [[0.] * 3 for i in range(3)]
+    v = [0.] * 3
+    for (rx, ry), s in zip(raw_points, screen_values):
+        vec = (float(rx), float(ry), 1.)
+        for i in range(3):
+            v[i] += vec[i] * s
+            for j in range(3):
+                m[i][j] += vec[i] * vec[j]
+    return solve3(m, v)
+
+
+######################################################################
+# Lerdge TFT display
+######################################################################
+
+class LerdgeTFT:
+    def __init__(self, config):
+        self.printer = printer = config.get_printer()
+        self.reactor = printer.get_reactor()
+        self.name = config.get_name()
+        ppins = printer.lookup_object('pins')
+        # Reset pin (also used to find the mcu driving the display)
+        reset_params = ppins.lookup_pin(config.get('reset_pin'))
+        self.mcu = mcu = reset_params['chip']
+        self.reset_pin = mcu.setup_pin('digital_out', reset_params)
+        self.reset_pin.setup_start_value(1, 1)
+        self.reset_pin.setup_max_duration(0.)
+        # Optional backlight and beeper
+        self.backlight_pin = None
+        bl_pin = config.get('backlight_pin', None)
+        if bl_pin is not None:
+            self.backlight_pin = ppins.setup_pin('digital_out', bl_pin)
+            self.backlight_pin.setup_start_value(1, 1)
+            self.backlight_pin.setup_max_duration(0.)
+        self.backlight_timeout = config.getfloat('backlight_timeout', 0.,
+                                                 minval=0.)
+        self.beeper_pin = None
+        beeper_pin = config.get('beeper_pin', None)
+        if beeper_pin is not None:
+            self.beeper_pin = ppins.setup_pin('digital_out', beeper_pin)
+            self.beeper_pin.setup_max_duration(0.)
+        self.beep_duration = config.getfloat('beep_duration', .015,
+                                             minval=0.)
+        self.last_beep_time = 0.
+        # FSMC bus configuration
+        self.bank = config.getint('fsmc_bank', 1, minval=1, maxval=4)
+        self.rs_line = config.getint('fsmc_rs_line', 16, minval=0, maxval=23)
+        addset = config.getint('fsmc_write_addset', 4, minval=0, maxval=15)
+        datast = config.getint('fsmc_write_datast', 10, minval=1,
+                               maxval=255)
+        self.bwtr = addset | (datast << 8)
+        self.btr = 15 | (15 << 4) | (60 << 8)
+        # Controller
+        choices = dict([(k, k) for k in CONTROLLERS])
+        choices['auto'] = 'auto'
+        self.controller = config.getchoice('controller', choices, 'auto')
+        self.default_controller = config.getchoice(
+            'fallback_controller', dict([(k, k) for k in CONTROLLERS]),
+            'st7796')
+        self.rotate_180 = config.getboolean('rotate_180', False)
+        self.invert_colors = config.getboolean('invert_colors', None)
+        self.width, self.height = 480, 320
+        # Colors
+        self.color_bg = parse_color(config, 'background_color', '000000')
+        self.color_fg = parse_color(config, 'text_color', 'ffffff')
+        self.color_sel_bg = parse_color(config, 'selected_background_color',
+                                        '1e5aa0')
+        self.color_sel_fg = parse_color(config, 'selected_text_color',
+                                        'ffffff')
+        self.color_edit_bg = parse_color(config, 'edit_background_color',
+                                         'b45a00')
+        self.color_edit_fg = parse_color(config, 'edit_text_color', 'ffffff')
+        self.color_btn_bg = parse_color(config, 'button_color', '303848')
+        self.color_btn_fg = parse_color(config, 'button_icon_color', 'ffffff')
+        self.color_btn_press = parse_color(config, 'button_pressed_color',
+                                           '1e5aa0')
+        self.buttons_left = config.getchoice(
+            'buttons_position', {'right': False, 'left': True}, 'right')
+        self.tap_activates = config.getboolean('touch_tap_activates', False)
+        # Framebuffer (16x6 characters of 8x16 pixels)
+        self.fb = [bytearray(TEXT_COLUMNS) for i in range(TEXT_ROWS * 16)]
+        self.old_fb = None
+        self.old_styles = None
+        self.icons = {}
+        self.screen_ready = False
+        self.mode = 'normal'
+        self.menu = self.display = None
+        self._compute_layout()
+        # MCU commands
+        self.oid = mcu.create_oid()
+        mcu.register_config_callback(self.build_config)
+        self.send_cmd_cmd = self.fill_cmd = self.bitmap_cmd = None
+        self.read_cmd = self.window_cmd = self.rle_cmd = None
+        # Touch panel - read by the MCU code (software SPI, also works
+        # after a shutdown) when the clock pin is given, otherwise via a
+        # hardware SPI bus of the MCU
+        self.touch_spi = None
+        self.touch_mcu_pins = None
+        self.touch_oid = self.touch_read_cmd = None
+        self.touch_enabled = False
+        self.touch_cal = list(DEFAULT_TOUCH_CALIBRATION)
+        self.need_calibration = False
+        cs_pin = config.get('touch_cs_pin', None)
+        if cs_pin is not None and config.get('touch_sclk_pin', None):
+            pins = []
+            for name in ['cs', 'sclk', 'mosi', 'miso']:
+                pin_params = ppins.lookup_pin(config.get('touch_%s_pin'
+                                                         % (name,)))
+                if pin_params['chip'] is not mcu:
+                    raise ppins.error("lerdge_tft touch pins must be on the"
+                                      " display mcu")
+                pins.append(pin_params['pin'])
+            self.touch_mcu_pins = pins
+            self.touch_oid = mcu.create_oid()
+            self.touch_enabled = True
+        elif cs_pin is not None:
+            cs_params = ppins.lookup_pin(cs_pin)
+            self.touch_spi = bus.MCU_SPI(
+                cs_params['chip'], config.get('touch_spi_bus', 'spi3'),
+                cs_params['pin'], 0,
+                config.getint('touch_spi_speed', 500000, minval=100000))
+            self.touch_enabled = True
+        if self.touch_enabled:
+            cal = config.getfloatlist('touch_calibration', None, count=6)
+            if cal is None:
+                self.need_calibration = config.getboolean(
+                    'touch_auto_calibrate', True)
+            else:
+                self.touch_cal = list(cal)
+            self.touch_threshold = config.getint(
+                'touch_pressure_threshold', 300, minval=1)
+            # Z1, Z2, X samples, Y samples (last command keeps PENIRQ on)
+            self.touch_query = ([0xb0, 0, 0, 0xc0, 0, 0]
+                                + [0xd0, 0, 0] * TOUCH_SAMPLES
+                                + [0x90, 0, 0] * TOUCH_SAMPLES)
+        self.touch_timer = self.reactor.register_timer(self._touch_poll)
+        self.repeat_timer = self.reactor.register_timer(self._repeat_event)
+        self.long_timer = self.reactor.register_timer(self._long_event)
+        self.backlight_timer = self.reactor.register_timer(
+            self._backlight_event)
+        self.touching = False
+        self.release_count = 0
+        self.int_state = False
+        self.press_target = None
+        self.repeat_count = 0
+        self.long_fired = False
+        self.backlight_on = True
+        self.swallow_press = False
+        self.last_activity = 0.
+        self.cal_points = []
+        self.cal_raw = []
+        self.cal_samples = []
+        self.int_pin = config.get('touch_int_pin', None)
+        if self.int_pin is not None and self.touch_enabled:
+            buttons = printer.load_object(config, 'buttons')
+            buttons.register_buttons([self.int_pin], self._touch_irq)
+        printer.register_event_handler('klippy:shutdown',
+                                       self._handle_shutdown)
+        # G-Code commands
+        gcode = printer.lookup_object('gcode')
+        gcode.register_command('TOUCH_CALIBRATE', self.cmd_TOUCH_CALIBRATE,
+                               desc=self.cmd_TOUCH_CALIBRATE_help)
+        gcode.register_command('TFT_REDRAW', self.cmd_TFT_REDRAW,
+                               desc=self.cmd_TFT_REDRAW_help)
+        # Mirror mode API
+        self.mirror_active = False
+        self.mirror_last = 0.
+        self.mirror_need_full = True
+        self.touch_clients = []
+        self.mirror_timer = self.reactor.register_timer(self._mirror_check)
+        webhooks = printer.lookup_object('webhooks')
+        webhooks.register_endpoint("lerdge_tft/draw", self._handle_draw)
+        webhooks.register_endpoint("lerdge_tft/subscribe_touch",
+                                   self._handle_subscribe_touch)
+        webhooks.register_endpoint("lerdge_tft/release",
+                                   self._handle_release)
+    def build_config(self):
+        self.mcu.add_config_cmd(
+            "config_tft_fsmc oid=%d bank=%d rs_line=%d btr=%d bwtr=%d" % (
+                self.oid, self.bank, self.rs_line, self.btr, self.bwtr))
+        cq = self.mcu.alloc_command_queue()
+        self.send_cmd_cmd = self.mcu.lookup_command(
+            "tft_fsmc_send_cmd oid=%c cmd=%c data=%*s", cq=cq)
+        self.fill_cmd = self.mcu.lookup_command(
+            "tft_fsmc_fill oid=%c x=%hu y=%hu w=%hu h=%hu color=%hu", cq=cq)
+        self.bitmap_cmd = self.mcu.lookup_command(
+            "tft_fsmc_bitmap oid=%c x=%hu y=%hu w=%hu scale=%c"
+            " fg=%hu bg=%hu data=%*s", cq=cq)
+        self.read_cmd = self.mcu.lookup_query_command(
+            "tft_fsmc_read oid=%c cmd=%c count=%c",
+            "tft_fsmc_read_response oid=%c data=%*s", oid=self.oid, cq=cq)
+        self.window_cmd = self.rle_cmd = None
+        if self.mcu.try_lookup_command(
+                "tft_fsmc_rle oid=%c data=%*s") is not None:
+            self.window_cmd = self.mcu.lookup_command(
+                "tft_fsmc_window oid=%c x=%hu y=%hu w=%hu h=%hu", cq=cq)
+            self.rle_cmd = self.mcu.lookup_command(
+                "tft_fsmc_rle oid=%c data=%*s", cq=cq)
+        if self.touch_mcu_pins is not None:
+            half_ticks = self.mcu.seconds_to_clock(1. / (2. * 400000.))
+            self.mcu.add_config_cmd(
+                "config_tft_touch oid=%d cs_pin=%s sclk_pin=%s mosi_pin=%s"
+                " miso_pin=%s half_ticks=%d" % (
+                    tuple([self.touch_oid] + self.touch_mcu_pins
+                          + [half_ticks])))
+            tcq = self.mcu.alloc_command_queue()
+            self.touch_read_cmd = self.mcu.lookup_query_command(
+                "tft_touch_read oid=%c",
+                "tft_touch_result oid=%c z=%hu x=%hu y=%hu",
+                oid=self.touch_oid, cq=tcq)
+    def _compute_layout(self):
+        w, h = self.width, self.height
+        self.scale = scale = 3 if w >= 480 and h >= 300 else 2
+        self.text_w = TEXT_COLUMNS * 8 * scale
+        self.text_h = TEXT_ROWS * 16 * scale
+        self.btn_w = w - self.text_w
+        self.btn_h = h // len(BUTTONS)
+        self.icon_scale = max(1, min(self.btn_w, self.btn_h) // 24)
+        if self.buttons_left:
+            self.btn_x, self.text_x = 0, self.btn_w
+        else:
+            self.btn_x, self.text_x = self.text_w, 0
+        self.text_y = (h - self.text_h) // 2
+
+    # Low level drawing
+    def _send_cmd(self, cmd, data=()):
+        self.send_cmd_cmd.send([self.oid, cmd, list(data)],
+                               reqclock=BACKGROUND_PRIORITY_CLOCK)
+    def fill_rect(self, x, y, w, h, color):
+        if w <= 0 or h <= 0:
+            return
+        rows = max(1, MAX_CMD_PIXELS // w)
+        while h > 0:
+            count = min(rows, h)
+            self.fill_cmd.send([self.oid, x, y, w, count, color],
+                               reqclock=BACKGROUND_PRIORITY_CLOCK)
+            y += count
+            h -= count
+    def draw_bitmap(self, x, y, width, rows, scale, fg, bg):
+        # rows is a list of bytearrays of (width+7)//8 bytes
+        row_bytes = (width + 7) // 8
+        per_msg = max(1, min(MAX_BITMAP_BYTES // row_bytes,
+                             MAX_CMD_PIXELS // (width * scale * scale)))
+        for i in range(0, len(rows), per_msg):
+            chunk = rows[i:i+per_msg]
+            data = bytearray()
+            for r in chunk:
+                data.extend(r[:row_bytes])
+            self.bitmap_cmd.send([self.oid, x, y + i * scale, width, scale,
+                                  fg, bg, data],
+                                 reqclock=BACKGROUND_PRIORITY_CLOCK)
+    def draw_string(self, x, y, text, scale, fg, bg):
+        text = bytearray(text.encode() if hasattr(text, 'encode') else text)
+        rows = [bytearray([font8x14.VGA_FONT[c][r] for c in text])
+                for r in range(16)]
+        # Split long strings so each message stays small
+        max_chars = max(1, min(MAX_BITMAP_BYTES,
+                               MAX_CMD_PIXELS // (8 * scale * scale)))
+        for i in range(0, len(text), max_chars):
+            part = [r[i:i+max_chars] for r in rows]
+            self.draw_bitmap(x + i * 8 * scale, y, len(part[0]) * 8, part,
+                             scale, fg, bg)
+    def draw_string_centered(self, y, text, scale, fg, bg):
+        x = max(0, (self.width - len(text) * 8 * scale) // 2)
+        self.draw_string(x, y, text, scale, fg, bg)
+
+    # Screen initialization
+    def _read_id(self):
+        try:
+            params = self.read_cmd.send([self.oid, 0xd3, 4])
+        except Exception:
+            logging.exception("lerdge_tft: unable to read display id")
+            return None
+        data = bytearray(params['data'])
+        if len(data) < 4:
+            return None
+        return (data[2] << 8) | data[3]
+    def _pause(self, delay):
+        self.reactor.pause(self.reactor.monotonic() + delay)
+    def _init_screen(self, eventtime):
+        self.screen_ready = False
+        # Hardware reset
+        print_time = self.mcu.estimated_print_time(eventtime) + .100
+        self.reset_pin.set_digital(print_time, 0)
+        self.reset_pin.set_digital(print_time + .020, 1)
+        self._pause(.100 + .020 + .150)
+        # Detect controller
+        name = self.controller
+        if name == 'auto':
+            chip_id = self._read_id()
+            name = self.default_controller
+            for cname, cinfo in CONTROLLERS.items():
+                if cinfo[3] == chip_id:
+                    name = cname
+                    break
+            logging.info("lerdge_tft: display id %s, using %s controller",
+                         "%04x" % (chip_id,) if chip_id is not None else "?",
+                         name)
+        init_seq, self.width, self.height, chip_id, invert = CONTROLLERS[name]
+        self._compute_layout()
+        if self.invert_colors is not None:
+            invert = self.invert_colors
+        for cmd, data, delay in init_seq:
+            self._send_cmd(cmd, data)
+            if delay:
+                self._pause(delay + .010)
+        self._send_cmd(0x21 if invert else 0x20)
+        madctl = MADCTL_LANDSCAPE_180 if self.rotate_180 else MADCTL_LANDSCAPE
+        self._send_cmd(0x36, [madctl])
+        self.fill_rect(0, 0, self.width, self.height, self.color_bg)
+        self._send_cmd(0x29)
+        self._pause(.020)
+        self.screen_ready = True
+        self.last_activity = self.reactor.monotonic()
+        if self.backlight_pin is not None:
+            self._set_backlight(True)
+            if self.backlight_timeout:
+                self.reactor.update_timer(self.backlight_timer,
+                                          self.reactor.NOW)
+        if self.need_calibration:
+            self.need_calibration = False
+            self._start_calibration()
+        else:
+            self.full_redraw()
+        self.mirror_need_full = True
+        if self.touch_enabled and self.int_pin is None:
+            self.reactor.update_timer(self.touch_timer, self.reactor.NOW)
+    def full_redraw(self):
+        if not self.screen_ready:
+            return
+        if self.mirror_active:
+            self.mirror_need_full = True
+            return
+        self.fill_rect(0, 0, self.width, self.height, self.color_bg)
+        for i in range(len(BUTTONS)):
+            self._draw_button(i, False)
+        self.old_fb = None
+        self.flush()
+    def _draw_button(self, index, pressed):
+        color = self.color_btn_press if pressed else self.color_btn_bg
+        x, y = self.btn_x, index * self.btn_h
+        self.fill_rect(x + 3, y + 3, self.btn_w - 6, self.btn_h - 6, color)
+        s = self.icon_scale
+        ix = x + (self.btn_w - 16 * s) // 2
+        iy = y + (self.btn_h - 16 * s) // 2
+        rows = [bytearray(r) for r in BUTTONS[index][1]]
+        self.draw_bitmap(ix, iy, 16, rows, s, self.color_btn_fg, color)
+
+    # Display interface (used by display.py)
+    def init(self):
+        if self.display is None:
+            self.display = self.printer.lookup_object(self.name, None)
+            self.menu = getattr(self.display, 'menu', None)
+        self.reactor.register_callback(self._init_screen)
+    def get_dimensions(self):
+        return (TEXT_COLUMNS, TEXT_ROWS)
+    def get_default_display_group(self):
+        return "_lerdge_16x6"
+    def set_glyphs(self, glyphs):
+        for glyph_name, glyph_data in glyphs.items():
+            icon = glyph_data.get('icon16x16')
+            if icon is not None:
+                self.icons[glyph_name] = icon
+    def clear(self):
+        for row in self.fb:
+            row[:] = bytearray(TEXT_COLUMNS)
+    def write_text(self, x, y, data):
+        if x >= TEXT_COLUMNS or y >= TEXT_ROWS:
+            return
+        data = bytearray(data)[:TEXT_COLUMNS - x]
+        base = y * 16
+        for i, c in enumerate(data):
+            glyph = font8x14.VGA_FONT[c]
+            for r in range(16):
+                self.fb[base + r][x + i] = glyph[r]
+    def write_graphics(self, x, y, data):
+        if x >= TEXT_COLUMNS or y >= TEXT_ROWS or len(data) != 16:
+            return
+        base = y * 16
+        for r in range(16):
+            self.fb[base + r][x] ^= data[r]
+    def write_glyph(self, x, y, glyph_name):
+        icon = self.icons.get(glyph_name)
+        if icon is not None and x < TEXT_COLUMNS - 1 and y < TEXT_ROWS:
+            base = y * 16
+            for r in range(16):
+                self.fb[base + r][x] = icon[0][r]
+                self.fb[base + r][x + 1] = icon[1][r]
+            return 2
+        char = TextGlyphs.get(glyph_name)
+        if char is not None:
+            self.write_text(x, y, char)
+            return 1
+        return 0
+    def _row_styles(self):
+        normal = (self.color_fg, self.color_bg)
+        styles = [normal] * TEXT_ROWS
+        menu = self.menu
+        if menu is None or not menu.is_running():
+            return styles
+        container = menu.stack_peek()
+        if container is None or not isinstance(container.selected, int):
+            return styles
+        row = container.selected - getattr(container, '_viewport_top', 0)
+        if 0 <= row < TEXT_ROWS:
+            item = container.selected_item()
+            if item is not None and item.is_editing():
+                styles[row] = (self.color_edit_fg, self.color_edit_bg)
+            else:
+                styles[row] = (self.color_sel_fg, self.color_sel_bg)
+        return styles
+    def flush(self):
+        if (not self.screen_ready or self.mode != 'normal'
+            or self.mirror_active):
+            return
+        styles = self._row_styles()
+        if self.old_fb is None:
+            self.old_fb = [bytearray(b'~' * TEXT_COLUMNS)
+                           for i in range(TEXT_ROWS * 16)]
+            self.old_styles = [None] * TEXT_ROWS
+        scale = self.scale
+        for trow in range(TEXT_ROWS):
+            base = trow * 16
+            fg, bg = style = styles[trow]
+            if self.old_styles[trow] != style:
+                lo, hi, rlo, rhi = 0, TEXT_COLUMNS - 1, 0, 15
+            else:
+                lo = rlo = 99
+                hi = rhi = -1
+                for r in range(16):
+                    new, old = self.fb[base + r], self.old_fb[base + r]
+                    if new == old:
+                        continue
+                    rlo = min(rlo, r)
+                    rhi = r
+                    for i in range(TEXT_COLUMNS):
+                        if new[i] != old[i]:
+                            lo = min(lo, i)
+                            hi = max(hi, i)
+                if hi < 0:
+                    continue
+            rows = [self.fb[base + r][lo:hi+1] for r in range(rlo, rhi + 1)]
+            self.draw_bitmap(self.text_x + lo * 8 * scale,
+                             self.text_y + (base + rlo) * scale,
+                             (hi - lo + 1) * 8, rows, scale, fg, bg)
+            for r in range(rlo, rhi + 1):
+                self.old_fb[base + r][:] = self.fb[base + r]
+            self.old_styles[trow] = style
+
+    # Backlight and beeper
+    def _set_backlight(self, on):
+        self.backlight_on = on
+        if self.backlight_pin is None:
+            return
+        eventtime = self.reactor.monotonic()
+        print_time = self.mcu.estimated_print_time(eventtime) + .050
+        self.backlight_pin.set_digital(print_time, 1 if on else 0)
+    def _backlight_event(self, eventtime):
+        if not self.backlight_timeout or self.backlight_pin is None:
+            return self.reactor.NEVER
+        idle = eventtime - self.last_activity
+        if idle >= self.backlight_timeout:
+            if self.backlight_on:
+                self._set_backlight(False)
+            return eventtime + 1.
+        return eventtime + max(1., self.backlight_timeout - idle)
+    def _beep(self, eventtime):
+        if self.beeper_pin is None or not self.beep_duration:
+            return
+        mcu = self.beeper_pin.get_mcu()
+        start = max(mcu.estimated_print_time(eventtime) + .050,
+                    self.last_beep_time + .010)
+        self.beeper_pin.set_digital(start, 1)
+        self.beeper_pin.set_digital(start + self.beep_duration, 0)
+        self.last_beep_time = start + self.beep_duration
+
+    # Touch handling
+    def _handle_shutdown(self):
+        if self.touch_read_cmd is None:
+            self.reactor.update_timer(self.touch_timer, self.reactor.NEVER)
+        elif self.screen_ready:
+            # The MCU touch code works in shutdown, but the interrupt pin
+            # is no longer reported, so poll instead
+            self.reactor.update_timer(self.touch_timer, self.reactor.NOW)
+    def _touch_irq(self, eventtime, state):
+        self.int_state = state
+        if state and self.screen_ready and not self.touching:
+            self.reactor.update_timer(self.touch_timer, self.reactor.NOW)
+    def _read_touch(self):
+        if self.touch_read_cmd is not None:
+            params = self.touch_read_cmd.send([self.touch_oid])
+            return params['z'], params['x'], params['y']
+        params = self.touch_spi.spi_transfer(self.touch_query)
+        resp = bytearray(params['response'])
+        vals = [((resp[i*3+1] << 8) | resp[i*3+2]) >> 3
+                for i in range(len(resp) // 3)]
+        pressure = vals[0] + 4095 - vals[1]
+        xs = vals[2:2+TOUCH_SAMPLES]
+        ys = vals[2+TOUCH_SAMPLES:2+2*TOUCH_SAMPLES]
+        return pressure, median(xs), median(ys)
+    def _touch_poll(self, eventtime):
+        is_shutdown = self.printer.is_shutdown()
+        if (not self.screen_ready or not self.touch_enabled
+            or (is_shutdown and self.touch_read_cmd is None)):
+            return self.reactor.NEVER
+        try:
+            pressure, rx, ry = self._read_touch()
+        except Exception:
+            logging.exception("lerdge_tft: touch read failed")
+            return eventtime + 1.
+        if pressure >= self.touch_threshold:
+            self.release_count = 0
+            if not self.touching:
+                self.touching = True
+                self._on_press(rx, ry, eventtime)
+            else:
+                self._on_hold(rx, ry, eventtime)
+            return eventtime + TOUCH_ACTIVE_POLL
+        if self.touching:
+            self.release_count += 1
+            if self.release_count < TOUCH_RELEASE_COUNT:
+                return eventtime + TOUCH_ACTIVE_POLL
+            self.touching = False
+            self._on_release(eventtime)
+        if is_shutdown:
+            return eventtime + TOUCH_SHUTDOWN_POLL
+        if self.int_pin is None:
+            return eventtime + TOUCH_IDLE_POLL
+        if self.int_state:
+            return eventtime + TOUCH_ACTIVE_POLL
+        return self.reactor.NEVER
+    def _raw_to_native(self, rx, ry):
+        c = self.touch_cal
+        return (c[0] * rx + c[1] * ry + c[2], c[3] * rx + c[4] * ry + c[5])
+    def _native_to_screen(self, x, y):
+        if self.rotate_180:
+            return (self.width - 1 - x, self.height - 1 - y)
+        return (x, y)
+    def _hit_test(self, rx, ry):
+        x, y = self._native_to_screen(*self._raw_to_native(rx, ry))
+        if self.btn_x <= x < self.btn_x + self.btn_w:
+            index = int(min(len(BUTTONS) - 1, max(0, y // self.btn_h)))
+            return ('button', index)
+        if self.text_x <= x < self.text_x + self.text_w:
+            row = int((y - self.text_y) // (16 * self.scale))
+            return ('row', min(TEXT_ROWS - 1, max(0, row)))
+        return None
+    def _key(self, key, eventtime):
+        # Back on the built-in status screen (menu closed) hands the panel
+        # back to an external screen client (d01_screen.py) if one listens
+        if (key == 'back' and self.touch_clients
+            and (self.menu is None or not self.menu.is_running())):
+            self._send_event({'action': 'resume'})
+            return
+        if self.menu is not None:
+            self.menu.key_event(key, eventtime)
+    def _is_editing(self):
+        menu = self.menu
+        if menu is None or not menu.is_running():
+            return False
+        container = menu.stack_peek()
+        if container is None:
+            return False
+        current = container.selected_item()
+        return current is not None and current.is_editing()
+    def _nav_key(self, name, eventtime, fast=False):
+        # The menu decrements values on 'up' while editing - for touch
+        # buttons the arrow direction should match the value change
+        if self._is_editing():
+            name = {'up': 'down', 'down': 'up'}[name]
+        self._key(('fast_' if fast else '') + name, eventtime)
+    def _on_press(self, rx, ry, eventtime):
+        self.last_activity = eventtime
+        if self.mode == 'calibrate':
+            self.cal_samples = [(rx, ry)]
+            return
+        if not self.backlight_on:
+            # First touch only wakes the screen
+            self._set_backlight(True)
+            self.reactor.update_timer(self.backlight_timer, self.reactor.NOW)
+            self.swallow_press = True
+            return
+        self.swallow_press = False
+        self._beep(eventtime)
+        if self.mirror_active:
+            self._send_touch('down', rx, ry)
+            return
+        target = self.press_target = self._hit_test(rx, ry)
+        if target is None or target[0] != 'button':
+            return
+        index = target[1]
+        self._draw_button(index, True)
+        name = BUTTONS[index][0]
+        if name in ('up', 'down'):
+            self._nav_key(name, eventtime)
+            self.repeat_count = 0
+            self.reactor.update_timer(self.repeat_timer,
+                                      eventtime + REPEAT_DELAY)
+        elif name == 'back':
+            self._key('back', eventtime)
+        elif name == 'ok':
+            self.long_fired = False
+            self.reactor.update_timer(self.long_timer,
+                                      eventtime + LONG_PRESS_TIME)
+    def _on_hold(self, rx, ry, eventtime):
+        self.last_activity = eventtime
+        if self.mode == 'calibrate':
+            self.cal_samples.append((rx, ry))
+        elif self.mirror_active and not self.swallow_press:
+            self._send_touch('move', rx, ry)
+    def _on_release(self, eventtime):
+        self.last_activity = eventtime
+        if self.mode == 'calibrate':
+            self._calibration_point_done()
+            return
+        if self.swallow_press:
+            self.swallow_press = False
+            return
+        if self.mirror_active:
+            self._send_touch('up', None, None)
+            return
+        self.reactor.update_timer(self.repeat_timer, self.reactor.NEVER)
+        self.reactor.update_timer(self.long_timer, self.reactor.NEVER)
+        target, self.press_target = self.press_target, None
+        if target is None:
+            return
+        if target[0] == 'button':
+            self._draw_button(target[1], False)
+            if BUTTONS[target[1]][0] == 'ok' and not self.long_fired:
+                self._key('click', eventtime)
+            return
+        self._tap_row(target[1], eventtime)
+    def _repeat_event(self, eventtime):
+        target = self.press_target
+        if not self.touching or target is None or target[0] != 'button':
+            return self.reactor.NEVER
+        self.repeat_count += 1
+        self._nav_key(BUTTONS[target[1]][0], eventtime,
+                      self.repeat_count >= REPEAT_FAST_COUNT)
+        return eventtime + REPEAT_TIME
+    def _long_event(self, eventtime):
+        if self.touching:
+            self.long_fired = True
+            self._key('long_click', eventtime)
+        return self.reactor.NEVER
+    def _tap_row(self, row, eventtime):
+        menu = self.menu
+        if menu is None:
+            return
+        if not menu.is_running():
+            # Tap on the status screen opens the menu
+            self._key('click', eventtime)
+            return
+        container = menu.stack_peek()
+        if container is None:
+            return
+        if self._is_editing():
+            self._key('click', eventtime)
+            return
+        index = getattr(container, '_viewport_top', 0) + row
+        if index >= len(container) or not container[index].is_enabled():
+            return
+        if index == container.selected or self.tap_activates:
+            container.select_at(index)
+            self._key('click', eventtime)
+        else:
+            container.select_at(index)
+            menu.timer = 0
+            self.display.request_redraw()
+
+    # Encoder / button events from the menu (knob module)
+    def menu_key_hook(self, key, eventtime):
+        self.last_activity = eventtime
+        if not self.backlight_on:
+            # The first action only wakes the screen
+            self._set_backlight(True)
+            self.reactor.update_timer(self.backlight_timer, self.reactor.NOW)
+            return True
+        if self.mode == 'calibrate':
+            return True
+        if self.mirror_active:
+            self._send_event({'action': 'key', 'key': key})
+            return True
+        return False
+
+    # Mirror mode (screen content rendered by an external program)
+    def _screen_point(self, rx, ry):
+        x, y = self._native_to_screen(*self._raw_to_native(rx, ry))
+        x = int(min(self.width - 1, max(0, x)))
+        y = int(min(self.height - 1, max(0, y)))
+        return x, y
+    def _send_touch(self, action, rx, ry):
+        msg = {'action': action}
+        if rx is not None:
+            msg['x'], msg['y'] = self._screen_point(rx, ry)
+        self._send_event(msg)
+    def _send_event(self, msg):
+        clients = []
+        for cconn, template in self.touch_clients:
+            if cconn.is_closed():
+                continue
+            clients.append((cconn, template))
+            tmp = dict(template)
+            tmp['params'] = msg
+            cconn.send(tmp)
+        self.touch_clients = clients
+    def _link_rate(self):
+        # Throughput of a UART link to the MCU in bytes/s.  This includes
+        # the USB port of Lerdge boards (a USB-serial chip on USART1).
+        # None for native USB and CAN, those are much faster.
+        baud = self.mcu.get_constants().get('SERIAL_BAUD')
+        if not baud:
+            return None
+        return int(baud) // 10
+    def _pending_bytes(self):
+        stats = self.mcu._serial.stats(self.reactor.monotonic())
+        total = 0
+        for name in ('ready_bytes', 'upcoming_bytes'):
+            m = re.search(r'\b%s=(\d+)' % (name,), stats)
+            if m:
+                total += int(m.group(1))
+        return total
+    def _enter_mirror(self):
+        if self.mirror_active:
+            return
+        self.mirror_active = True
+        self.press_target = None
+        self.reactor.update_timer(self.repeat_timer, self.reactor.NEVER)
+        self.reactor.update_timer(self.long_timer, self.reactor.NEVER)
+        self.reactor.update_timer(self.mirror_timer,
+                                  self.reactor.monotonic() + MIRROR_CHECK_TIME)
+        logging.info("lerdge_tft: mirror mode enabled")
+    def _exit_mirror(self):
+        if not self.mirror_active:
+            return
+        self.mirror_active = False
+        self.reactor.update_timer(self.mirror_timer, self.reactor.NEVER)
+        logging.info("lerdge_tft: mirror mode disabled")
+        if self.mode == 'normal':
+            self.full_redraw()
+    def _mirror_check(self, eventtime):
+        if not self.mirror_active:
+            return self.reactor.NEVER
+        if eventtime - self.mirror_last > MIRROR_TIMEOUT:
+            self._exit_mirror()
+            return self.reactor.NEVER
+        return eventtime + MIRROR_CHECK_TIME
+    def _is_printing(self):
+        # "Printing" here means the MCU link carries time critical commands,
+        # so draw clients must throttle.  That's any running gcode (homing,
+        # macros, moves), not just a virtual_sdcard print: on a slow MCU a
+        # saturated display stream starves queue_step/trsync during G28
+        # and the MCU shuts down with "Timer too close".
+        eventtime = self.reactor.monotonic()
+        ps = self.printer.lookup_object('print_stats', None)
+        if ps is not None and ps.get_status(eventtime).get('state') in (
+                'printing', 'paused'):
+            return True
+        it = self.printer.lookup_object('idle_timeout', None)
+        return (it is not None
+                and it.get_status(eventtime).get('state') == 'Printing')
+    def _handle_draw(self, web_request):
+        # Never let a bad request raise an internal error (that would
+        # shut down the printer)
+        try:
+            self._do_draw(web_request)
+        except web_request.error:
+            raise
+        except Exception as e:
+            logging.exception("lerdge_tft: draw request failed")
+            raise web_request.error("lerdge_tft draw failed: %s" % (e,))
+    def _do_draw(self, web_request):
+        if self.rle_cmd is None:
+            raise web_request.error("MCU firmware lacks tft_fsmc_rle support")
+        if not self.screen_ready:
+            raise web_request.error("Display not ready")
+        self.mirror_last = self.reactor.monotonic()
+        self._enter_mirror()
+        rects = web_request.get('rects', [])
+        need_full = self.mirror_need_full or self.mode != 'normal'
+        if self.mode == 'normal':
+            for rect in rects:
+                x, y, w, h = [int(v) for v in rect['window']]
+                if (w <= 0 or h <= 0 or x < 0 or y < 0
+                    or x + w > self.width or y + h > self.height):
+                    raise web_request.error("Invalid window")
+                self.window_cmd.send([self.oid, x, y, w, h],
+                                     reqclock=BACKGROUND_PRIORITY_CLOCK)
+                for chunk in rect['chunks']:
+                    data = bytearray(base64.b64decode(chunk))
+                    if (len(data) > MAX_RLE_BYTES
+                        or rle_pixels(data) > MAX_CMD_PIXELS):
+                        raise web_request.error("Chunk too large")
+                    self.rle_cmd.send([self.oid, data],
+                                      reqclock=BACKGROUND_PRIORITY_CLOCK)
+                if rect.get('full'):
+                    self.mirror_need_full = need_full = False
+        web_request.send({'pending_bytes': self._pending_bytes(),
+                          'need_full': need_full,
+                          'width': self.width, 'height': self.height,
+                          'printing': self._is_printing(),
+                          'link_rate': self._link_rate()})
+    def _handle_subscribe_touch(self, web_request):
+        if not self.touch_enabled:
+            raise web_request.error("Touch panel not configured")
+        cconn = web_request.get_client_connection()
+        template = web_request.get_dict('response_template', {})
+        self.touch_clients.append((cconn, template))
+        web_request.send({'width': self.width, 'height': self.height})
+    def _handle_release(self, web_request):
+        self._exit_mirror()
+        web_request.send({})
+
+    # Touch calibration
+    def _start_calibration(self):
+        w, h = self.width, self.height
+        self.mode = 'calibrate'
+        self.cal_points = [(30, 30), (w - 31, 30), (w - 31, h - 31),
+                           (30, h - 31), (w // 2, h // 2)]
+        self.cal_raw = []
+        self.cal_samples = []
+        self._draw_calibration()
+    def _draw_target(self, x, y, color):
+        self.fill_rect(x - 15, y - 1, 31, 3, color)
+        self.fill_rect(x - 1, y - 15, 3, 31, color)
+    def _draw_calibration(self, message=None):
+        bg, fg = self.color_bg, self.color_fg
+        self.fill_rect(0, 0, self.width, self.height, bg)
+        self.draw_string_centered(self.height // 2 - 56,
+                                  "Touch calibration", 2, fg, bg)
+        self.draw_string_centered(self.height // 2 + 24,
+                                  message or "Tap the center of the cross",
+                                  1, fg, bg)
+        index = len(self.cal_raw)
+        self.draw_string_centered(self.height // 2 + 44, "%d / %d" % (
+            index + 1, len(self.cal_points)), 1, fg, bg)
+        x, y = self.cal_points[index]
+        self._draw_target(x, y, self.color_edit_bg)
+    def _calibration_point_done(self):
+        if len(self.cal_samples) < 2:
+            return
+        # Ignore the first sample (finger still settling)
+        samples = self.cal_samples[1:]
+        rx = median([s[0] for s in samples])
+        ry = median([s[1] for s in samples])
+        self.cal_raw.append((rx, ry))
+        if len(self.cal_raw) < len(self.cal_points):
+            self._draw_calibration()
+            return
+        # Fit raw -> native panel coordinates
+        native = []
+        for x, y in self.cal_points:
+            if self.rotate_180:
+                native.append((self.width - 1 - x, self.height - 1 - y))
+            else:
+                native.append((x, y))
+        cx = fit_affine(self.cal_raw, [p[0] for p in native])
+        cy = fit_affine(self.cal_raw, [p[1] for p in native])
+        error = None
+        if cx is not None and cy is not None:
+            error = 0.
+            for (rx, ry), (nx, ny) in zip(self.cal_raw, native):
+                ex = cx[0] * rx + cx[1] * ry + cx[2] - nx
+                ey = cy[0] * rx + cy[1] * ry + cy[2] - ny
+                error = max(error, (ex * ex + ey * ey) ** .5)
+        gcode = self.printer.lookup_object('gcode')
+        if error is None or error > 20.:
+            gcode.respond_info("Touch calibration failed (error %s),"
+                               " please try again" % (
+                                   "%.1fpx" % (error,) if error is not None
+                                   else "singular"))
+            self.cal_raw = []
+            self._draw_calibration("Calibration failed - try again")
+            return
+        self.touch_cal = cx + cy
+        value = ", ".join(["%.6f" % (v,) for v in self.touch_cal])
+        configfile = self.printer.lookup_object('configfile')
+        configfile.set(self.name, 'touch_calibration', value)
+        gcode.respond_info(
+            "Touch calibration done (max error %.1f pixels).\n"
+            "touch_calibration: %s\n"
+            "Run SAVE_CONFIG to store it in printer.cfg" % (error, value))
+        self.mode = 'normal'
+        self.full_redraw()
+    cmd_TOUCH_CALIBRATE_help = "Calibrate the Lerdge TFT touch screen"
+    def cmd_TOUCH_CALIBRATE(self, gcmd):
+        if not self.touch_enabled:
+            raise gcmd.error("Touch panel not configured (touch_cs_pin)")
+        if not self.screen_ready:
+            raise gcmd.error("Display not ready")
+        self._start_calibration()
+        gcmd.respond_info("Tap the crosses shown on the screen")
+    cmd_TFT_REDRAW_help = "Reinitialize and redraw the Lerdge TFT display"
+    def cmd_TFT_REDRAW(self, gcmd):
+        if gcmd.get_int('INIT', 0):
+            self.reactor.register_callback(self._init_screen)
+        elif self.mode == 'calibrate':
+            self._draw_calibration()
+        else:
+            self.full_redraw()

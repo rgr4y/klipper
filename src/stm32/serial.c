@@ -6,6 +6,7 @@
 
 #include "autoconf.h" // CONFIG_SERIAL_BAUD
 #include "board/armcm_boot.h" // armcm_enable_irq
+#include "board/misc.h" // timer_read_time
 #include "board/serial_irq.h" // serial_rx_byte
 #include "command.h" // DECL_CONSTANT_STR
 #include "internal.h" // enable_pclock
@@ -98,15 +99,55 @@ serial_enable_tx_irq(void)
     USARTx->CR1 = CR1_FLAGS | USART_CR1_TXEIE;
 }
 
+static void
+serial_set_baud(uint32_t baud)
+{
+    uint32_t pclk = get_pclock_frequency((uint32_t)USARTx);
+    uint32_t div = DIV_ROUND_CLOSEST(pclk, baud);
+    USARTx->BRR = (((div / 16) << USART_BRR_DIV_Mantissa_Pos)
+                   | ((div % 16) << USART_BRR_DIV_Fraction_Pos));
+}
+
+// Until a valid message arrives, alternate between the configured and
+// the fallback baud rate so that a host using either rate can connect.
+#define FALLBACK_PERIOD_MS 20000
+
+void
+serial_fallback_task(void)
+{
+    static uint8_t done, use_fallback;
+    static uint32_t last, elapsed_ms, ticks;
+    if (!CONFIG_SERIAL_BAUD_FALLBACK || done)
+        return;
+    if (serial_rx_valid) {
+        done = 1;
+        return;
+    }
+    uint32_t now = timer_read_time();
+    if (!last)
+        last = now;
+    ticks += now - last;
+    last = now;
+    uint32_t ms_ticks = timer_from_us(1000);
+    while (ticks >= ms_ticks) {
+        ticks -= ms_ticks;
+        elapsed_ms++;
+    }
+    if (elapsed_ms >= FALLBACK_PERIOD_MS) {
+        elapsed_ms = 0;
+        use_fallback = !use_fallback;
+        serial_set_baud(use_fallback ? CONFIG_SERIAL_BAUD_FALLBACK
+                        : CONFIG_SERIAL_BAUD);
+    }
+}
+DECL_TASK(serial_fallback_task);
+
 void
 serial_init(void)
 {
     enable_pclock((uint32_t)USARTx);
 
-    uint32_t pclk = get_pclock_frequency((uint32_t)USARTx);
-    uint32_t div = DIV_ROUND_CLOSEST(pclk, CONFIG_SERIAL_BAUD);
-    USARTx->BRR = (((div / 16) << USART_BRR_DIV_Mantissa_Pos)
-                   | ((div % 16) << USART_BRR_DIV_Fraction_Pos));
+    serial_set_baud(CONFIG_SERIAL_BAUD);
     USARTx->CR1 = CR1_FLAGS;
     armcm_enable_irq(USARTx_IRQHandler, USARTx_IRQn, 0);
 

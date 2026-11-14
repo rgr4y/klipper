@@ -1,0 +1,468 @@
+#!/usr/bin/env python3
+# Mirror an X display (for example KlipperScreen on Xvfb) to a Lerdge TFT
+#
+# Xvfb must be started with "-fbdir <dir>" so that the screen contents
+# are available as an XWD file.  Changed regions are RLE encoded and sent
+# to the "lerdge_tft" display module via the Klipper API socket.  Touch
+# events from the module are injected into the X display.
+#
+# Requirements: python3-numpy, python3-xlib
+#
+# Copyright (C) 2026  Klipper Lerdge TFT contributors
+#
+# This file may be distributed under the terms of the GNU GPLv3 license.
+import os, time, json, socket, base64, threading, mmap, struct
+import logging, argparse
+import numpy as np
+
+TILE = 16
+MAX_CHUNK = 48
+MAX_LITERAL = (MAX_CHUNK - 1) // 2
+MAX_REPEAT = 128
+# Pixels per MCU command (about 0.1us each), keeps every command short
+MAX_CHUNK_PIXELS = 1024
+MAX_BYTES_PER_REQUEST = 3000
+PENDING_LIMIT = 1500
+POLL_TIME = 0.10
+PRINTING_POLL_TIME = 0.50
+KEEPALIVE_TIME = 5.
+# While printing, the display may use this share of a UART link to the MCU
+PRINT_LINK_SHARE = 0.20
+MAX_THROTTLE_WAIT = 10.
+
+######################################################################
+# Klipper API socket client
+######################################################################
+
+class KlippyClient:
+    def __init__(self, path, touch_cb):
+        self.path = path
+        self.touch_cb = touch_cb
+        self.sock = None
+        self.lock = threading.Lock()
+        self.next_id = 0
+        self.pending = {}
+        self.reader = None
+    def connect(self):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(self.path)
+        self.sock = sock
+        self.pending = {}
+        self.reader = threading.Thread(target=self._read_loop, daemon=True)
+        self.reader.start()
+    def close(self):
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        self.sock = None
+        with self.lock:
+            for ev in self.pending.values():
+                ev['error'] = {'message': 'disconnected'}
+                ev['event'].set()
+            self.pending = {}
+    def _read_loop(self):
+        sock = self.sock
+        buf = b""
+        while True:
+            try:
+                data = sock.recv(65536)
+            except OSError:
+                data = b""
+            if not data:
+                break
+            buf += data
+            while b"\x03" in buf:
+                msg, buf = buf.split(b"\x03", 1)
+                try:
+                    obj = json.loads(msg)
+                except ValueError:
+                    continue
+                self._handle(obj)
+        self.close()
+    def _handle(self, obj):
+        if obj.get('method') == 'lerdge_touch':
+            try:
+                self.touch_cb(obj.get('params', {}))
+            except Exception:
+                logging.exception("touch callback failed")
+            return
+        req_id = obj.get('id')
+        with self.lock:
+            ev = self.pending.pop(req_id, None)
+        if ev is not None:
+            ev['result'] = obj.get('result')
+            ev['error'] = obj.get('error')
+            ev['event'].set()
+    def request(self, method, params, timeout=10.):
+        if self.sock is None:
+            raise IOError("not connected")
+        ev = {'event': threading.Event(), 'result': None, 'error': None}
+        with self.lock:
+            self.next_id += 1
+            req_id = self.next_id
+            self.pending[req_id] = ev
+        data = json.dumps({'id': req_id, 'method': method,
+                           'params': params}).encode() + b"\x03"
+        self.sock.sendall(data)
+        if not ev['event'].wait(timeout):
+            with self.lock:
+                self.pending.pop(req_id, None)
+            raise IOError("timeout waiting for %s" % (method,))
+        if ev['error'] is not None:
+            raise IOError("%s: %s" % (method, ev['error']))
+        return ev['result']
+
+######################################################################
+# XWD framebuffer access (Xvfb -fbdir)
+######################################################################
+
+class XwdFrame:
+    def __init__(self, path):
+        self.path = path
+        f = open(path, 'rb')
+        self.mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        f.close()
+        hdr = struct.unpack(">25I", self.mm[:100])
+        if hdr[0] > 0x10000:
+            hdr = struct.unpack("<25I", self.mm[:100])
+        header_size, self.width, self.height = hdr[0], hdr[4], hdr[5]
+        self.byte_order, self.bpp, self.bytes_per_line = hdr[7], hdr[11], \
+            hdr[12]
+        ncolors = hdr[19]
+        self.offset = header_size + ncolors * 12
+        if self.bpp not in (16, 32):
+            raise Exception("Unsupported XWD depth %d" % (self.bpp,))
+    def read_raw(self):
+        # Copy of the raw framebuffer contents
+        size = self.bytes_per_line * self.height
+        return bytes(self.mm[self.offset:self.offset + size])
+    def to_rgb565(self, raw):
+        if self.bpp == 16:
+            dt = np.dtype('<u2' if self.byte_order == 0 else '>u2')
+            arr = np.frombuffer(raw, dtype=dt)
+            arr = arr.reshape(self.height, self.bytes_per_line // 2)
+            return arr[:, :self.width].astype(np.uint16)
+        dt = np.dtype('<u4' if self.byte_order == 0 else '>u4')
+        arr = np.frombuffer(raw, dtype=dt)
+        arr = arr.reshape(self.height, self.bytes_per_line // 4)
+        arr = arr[:, :self.width]
+        r = (arr >> 19) & 0x1f
+        g = (arr >> 10) & 0x3f
+        b = (arr >> 3) & 0x1f
+        return ((r << 11) | (g << 5) | b).astype(np.uint16)
+
+######################################################################
+# Encoding
+######################################################################
+
+def dirty_rects(cur, prev):
+    h, w = cur.shape
+    th, tw = h // TILE, w // TILE
+    if prev is None:
+        return [(0, 0, w, h)]
+    diff = (cur[:th*TILE, :tw*TILE] != prev[:th*TILE, :tw*TILE])
+    tiles = diff.reshape(th, TILE, tw, TILE).any(axis=(1, 3))
+    spans = []
+    for ty in range(th):
+        row = tiles[ty]
+        tx = 0
+        while tx < tw:
+            if not row[tx]:
+                tx += 1
+                continue
+            start = tx
+            while tx < tw and row[tx]:
+                tx += 1
+            spans.append([start, tx, ty, ty + 1])
+    # Merge vertically adjacent spans with the same horizontal extent
+    merged = []
+    for sp in spans:
+        for m in merged:
+            if m[0] == sp[0] and m[1] == sp[1] and m[3] == sp[2]:
+                m[3] = sp[3]
+                break
+        else:
+            merged.append(sp)
+    return [(x0 * TILE, y0 * TILE, (x1 - x0) * TILE, (y1 - y0) * TILE)
+            for x0, x1, y0, y1 in merged]
+
+def rle_tokens(pixels):
+    # pixels: 1-d uint16 array; returns list of encoded tokens (bytes)
+    n = len(pixels)
+    if not n:
+        return []
+    starts = np.concatenate(([0], np.flatnonzero(pixels[1:] != pixels[:-1])
+                             + 1))
+    lengths = np.diff(np.concatenate((starts, [n])))
+    be = pixels.astype('>u2').tobytes()
+    tokens = []
+    lit_start = lit_len = 0
+    def flush_literal(start, count):
+        while count:
+            c = min(count, MAX_LITERAL)
+            tokens.append(bytes([c - 1]) + be[start*2:(start+c)*2])
+            start += c
+            count -= c
+    for s, l in zip(starts.tolist(), lengths.tolist()):
+        if l >= 3:
+            if lit_len:
+                flush_literal(lit_start, lit_len)
+                lit_len = 0
+            color = be[s*2:s*2+2]
+            while l:
+                c = min(l, MAX_REPEAT)
+                tokens.append(bytes([0x80 | (c - 1)]) + color)
+                l -= c
+        else:
+            if not lit_len:
+                lit_start = s
+            lit_len += l
+    if lit_len:
+        flush_literal(lit_start, lit_len)
+    return tokens
+
+def token_pixels(t):
+    return (t[0] & 0x7f) + 1
+
+def pack_chunks(tokens):
+    chunks = []
+    cur = b""
+    pixels = 0
+    for t in tokens:
+        tp = token_pixels(t)
+        if len(cur) + len(t) > MAX_CHUNK or pixels + tp > MAX_CHUNK_PIXELS:
+            chunks.append(cur)
+            cur = b""
+            pixels = 0
+        cur += t
+        pixels += tp
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+######################################################################
+# Touch injection
+######################################################################
+
+# Knob (encoder) events from the Klipper menu keys, as keyboard navigation
+# for KlipperScreen ("keyboard_navigation: True"): (key name, with shift)
+KEY_MAP = {
+    'up': ('Tab', False), 'fast_up': ('Tab', False),
+    'down': ('Tab', True), 'fast_down': ('Tab', True),
+    'click': ('Return', False),
+    # Escape returns to the main screen from anywhere
+    'long_click': ('Escape', False), 'back': ('BackSpace', False),
+}
+
+class TouchInjector:
+    # A short touch becomes a click at the touch position, dragging the
+    # finger scrolls (mouse wheel), holding it still presses the button.
+    DRAG_THRESHOLD = 12
+    SCROLL_STEP = 24
+    HOLD_TIME = 0.6
+    def __init__(self, display_name):
+        from Xlib import display as xdisplay, X, XK
+        from Xlib.ext import xtest
+        self.X = X
+        self.XK = XK
+        self.xtest = xtest
+        self.d = xdisplay.Display(display_name)
+        self.state = None
+        self.start = self.last = (0, 0)
+        self.start_time = 0.
+        self.lock = threading.Lock()
+    def _move(self, x, y):
+        self.xtest.fake_input(self.d, self.X.MotionNotify, x=x, y=y)
+    def _button(self, button, press):
+        self.xtest.fake_input(self.d, self.X.ButtonPress if press
+                              else self.X.ButtonRelease, button)
+    def handle(self, params):
+        with self.lock:
+            self._handle(params)
+            self.d.sync()
+    def _key(self, name, shift=False):
+        X, xtest = self.X, self.xtest
+        code = self.d.keysym_to_keycode(self.XK.string_to_keysym(name))
+        shift_code = self.d.keysym_to_keycode(
+            self.XK.string_to_keysym('Shift_L'))
+        if shift:
+            xtest.fake_input(self.d, X.KeyPress, shift_code)
+        xtest.fake_input(self.d, X.KeyPress, code)
+        xtest.fake_input(self.d, X.KeyRelease, code)
+        if shift:
+            xtest.fake_input(self.d, X.KeyRelease, shift_code)
+    def _handle(self, params):
+        action = params.get('action')
+        if action == 'key':
+            key = KEY_MAP.get(params.get('key'))
+            if key is not None:
+                self._key(*key)
+            return
+        if action == 'down':
+            x, y = params['x'], params['y']
+            self.state = 'pending'
+            self.start = self.last = (x, y)
+            self.start_time = time.time()
+            self._move(x, y)
+        elif action == 'move' and self.state is not None:
+            x, y = params['x'], params['y']
+            dx, dy = x - self.start[0], y - self.start[1]
+            if self.state == 'pending':
+                if max(abs(dx), abs(dy)) > self.DRAG_THRESHOLD:
+                    self.state = 'scroll'
+                    self.last = self.start
+                elif time.time() - self.start_time > self.HOLD_TIME:
+                    self.state = 'pressed'
+                    self._button(1, True)
+            if self.state == 'scroll':
+                steps = int((self.last[1] - y) / self.SCROLL_STEP)
+                for i in range(abs(steps)):
+                    # Finger moving up scrolls the content down
+                    button = 5 if steps > 0 else 4
+                    self._button(button, True)
+                    self._button(button, False)
+                if steps:
+                    self.last = (x, self.last[1] - steps * self.SCROLL_STEP)
+            elif self.state == 'pressed':
+                self._move(x, y)
+        elif action == 'up':
+            if self.state == 'pending':
+                self._move(*self.start)
+                self._button(1, True)
+                self._button(1, False)
+            elif self.state == 'pressed':
+                self._button(1, False)
+            self.state = None
+
+######################################################################
+# Main loop
+######################################################################
+
+class Mirror:
+    def __init__(self, args):
+        self.args = args
+        self.prev = None
+        self.printing = False
+        self.link_rate = None
+        self.link_free = 0.
+        self.injector = None
+    def touch(self, params):
+        if self.injector is not None:
+            self.injector.handle(params)
+    def send_rects(self, client, frame, rects, full):
+        batch = []
+        size = 0
+        result = None
+        for idx, (x, y, w, h) in enumerate(rects):
+            region = frame[y:y+h, x:x+w].reshape(-1)
+            chunks = pack_chunks(rle_tokens(region))
+            rect = {'window': [x, y, w, h],
+                    'chunks': [base64.b64encode(c).decode() for c in chunks]}
+            if full and idx == len(rects) - 1:
+                rect['full'] = True
+            batch.append(rect)
+            size += 12 + sum(len(c) + 8 for c in chunks)
+            if size >= MAX_BYTES_PER_REQUEST:
+                result = self.draw(client, batch, size)
+                batch, size = [], 0
+        if batch or result is None:
+            result = self.draw(client, batch, size)
+        return result
+    def throttle(self, size):
+        # While printing, keep the display below a share of the MCU link
+        # bandwidth (the display messages are already sent with background
+        # priority, this also bounds their total volume)
+        if not size or not self.printing or not self.link_rate:
+            return
+        budget = self.link_rate * self.args.print_share
+        now = time.time()
+        wait = self.link_free - now
+        if wait > 0:
+            time.sleep(min(wait, MAX_THROTTLE_WAIT))
+            now = time.time()
+        self.link_free = max(now, self.link_free) + size / budget
+    def draw(self, client, rects, size=0):
+        self.throttle(size)
+        res = client.request("lerdge_tft/draw", {'rects': rects})
+        self.printing = res.get('printing', False)
+        self.link_rate = res.get('link_rate')
+        # Simple flow control - wait for the serial queue to drain
+        while res.get('pending_bytes', 0) > PENDING_LIMIT:
+            time.sleep(0.02)
+            res = client.request("lerdge_tft/draw", {'rects': []})
+        return res
+    def run_once(self, client, fb):
+        res = client.request("lerdge_tft/draw", {'rects': []})
+        self.prev = None
+        last_keepalive = time.time()
+        need_full = True
+        prev_raw = None
+        while True:
+            raw = fb.read_raw()
+            if raw == prev_raw and not need_full:
+                # Nothing changed - only keep the mirror mode alive
+                if time.time() - last_keepalive > KEEPALIVE_TIME:
+                    res = self.draw(client, [])
+                    last_keepalive = time.time()
+                    need_full = res.get('need_full', False)
+                time.sleep(PRINTING_POLL_TIME if self.printing
+                           else POLL_TIME)
+                continue
+            prev_raw = raw
+            frame = fb.to_rgb565(raw)
+            if need_full:
+                rects = [(0, 0, frame.shape[1], frame.shape[0])]
+                res = self.send_rects(client, frame, rects, True)
+                last_keepalive = time.time()
+            else:
+                rects = dirty_rects(frame, self.prev)
+                if rects:
+                    res = self.send_rects(client, frame, rects, False)
+                    last_keepalive = time.time()
+                elif time.time() - last_keepalive > KEEPALIVE_TIME:
+                    res = self.draw(client, [])
+                    last_keepalive = time.time()
+            self.prev = frame
+            need_full = res.get('need_full', False)
+            time.sleep(PRINTING_POLL_TIME if self.printing else POLL_TIME)
+    def run(self):
+        while True:
+            client = None
+            try:
+                if self.injector is None:
+                    self.injector = TouchInjector(self.args.display)
+                fb = XwdFrame(self.args.xwd)
+                client = KlippyClient(self.args.socket, self.touch)
+                client.connect()
+                client.request("lerdge_tft/subscribe_touch", {
+                    'response_template': {'method': 'lerdge_touch'}})
+                logging.info("Connected, mirroring %dx%d",
+                             fb.width, fb.height)
+                self.run_once(client, fb)
+            except Exception as e:
+                logging.info("Mirror error: %s", e)
+                self.injector = None
+            finally:
+                if client is not None:
+                    client.close()
+            time.sleep(3.)
+
+def main():
+    p = argparse.ArgumentParser(description="Lerdge TFT X display mirror")
+    p.add_argument("-s", "--socket",
+                   default=os.path.expanduser(
+                       "~/printer_data/comms/klippy.sock"))
+    p.add_argument("-d", "--display", default=":99")
+    p.add_argument("-x", "--xwd", default="/dev/shm/lerdge/Xvfb_screen0")
+    p.add_argument("--print-share", type=float, default=PRINT_LINK_SHARE,
+                   help="share of a UART link to the MCU that the display"
+                   " may use while printing (default %(default)s)")
+    args = p.parse_args()
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(message)s")
+    Mirror(args).run()
+
+if __name__ == '__main__':
+    main()
