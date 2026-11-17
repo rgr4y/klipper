@@ -55,6 +55,12 @@ class UartBridge:
             self.input_fds = self._open_pty(path, readable=False)
             self.input_buf = b""
             self.beeper_name = config.get('beeper', None)
+            # pwm_cycle_time spaces pin changes >= min_schedule_time (100ms)
+            # apart, so beeps sent faster than that schedule ever later and
+            # keep playing after input stops. Drop a new tone once earlier
+            # changes are scheduled this far ahead of now.
+            self.beeper_max_lag = config.getfloat('beeper_max_lag', .3,
+                                                  minval=0.)
             self.beeper = None
             if self.beeper_name is not None:
                 self.reactor.register_fd(self.input_fds[0], self._beeper_readable)
@@ -190,6 +196,9 @@ class UartBridge:
         mcu = self.beeper.mcu_pin.get_mcu()
         print_time = mcu.estimated_print_time(
             eventtime + mcu.min_schedule_time())
+        if duty and (self.beeper.last_print_time - print_time
+                     > self.beeper_max_lag):
+            return  # stale tone; "off" always passes so it never sticks on
         cycle = 1. / freq if duty else self.beeper.default_cycle_time
         self.beeper._set_pin(print_time, duty, cycle)
     def get_status(self, eventtime):
